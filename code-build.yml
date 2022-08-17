@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: CodePipeline for running CI testing on a GitHub pull request
+
+Parameters:
+
+  EnvironmentType:
+    Description: Environment that the pipeline exists in
+    Type: String
+    Default: dev
+
+  EnvironmentRegion:
+    Description: Shortened region notation
+    Type: String
+    Default: us-west-1
+
+  GithubOwner:
+    Description: The owner of the GitHub repository.
+    Type: String
+    Default: ramchandra-guthula
+
+  GithubRepo:
+    Description: Name of the Github Repo for this asset
+    Type: String
+    Default: sample-java-app
+
+  GithubBranchRegex:
+    Description: "Identifies the branches for which PRs should be tested (default: master)"
+    Type: String
+    Default: "master"
+
+  ImageName:
+    Description: "Build image name"
+    Type: String
+    Default: aws/codebuild/standard
+
+  ImageVersion:
+    Description: "Build image version"
+    Type: String
+    Default: 2.0
+
+Resources:
+
+  aktestParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: aktest
+      Type: String
+      Value: string_to_read_from_build
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      RoleName: !Sub deploy-${GithubRepo}-policy
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub deploy-${GithubRepo}-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+              - Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/deploy-${GithubRepo}-${EnvironmentType}-${EnvironmentRegion}:*
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*
+              - Effect: Allow
+                Action:
+                  - cloudformation:ListStacks
+                  - cloudformation:DescribeStacks
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/*
+    DependsOn: aktestParam
+    
+  DeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      ConcurrentBuildLimit: 1
+      Name: !Sub deploy-${GithubRepo}-${EnvironmentType}-${EnvironmentRegion}
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Source:
+        Type: GITHUB
+        Location: !Sub https://github.com/${GithubOwner}/${GithubRepo}.git
+        Auth:
+          Type: OAUTH
+          Resource: !Ref GithubToken
+        BuildSpec: |
+          version: 0.2
+          env:
+            shell: bash
+            parameter-store:
+               SAMPLE_VAR: aktest
+          phases:
+            install:
+              runtime-versions:
+                java: openjdk11
+              commands:
+                - apt-get install jq -y  
+            pre_build:
+              commands:
+                - ls -la
+            build:
+              commands: 
+                - set -e
+                # this will not print the value, code build will mask the value
+                - echo "Here is the param value - ${SAMPLE_VAR}"
+                - ECHO_PARAM=$(aws ssm get-parameter --name aktest --query "Parameter.Value" --output text)
+                - echo "$ECHO_PARAM"
+                - echo "===== Build sample java project======="
+                - mvn clean install
+                - echo "Verify AWS version"
+                - aws --version
+                - echo "========List all cloudformation stacks======="
+                - aws cloudformation list-stacks --stack-status-filter CREATE_COMPLETE
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - mvn package
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Sub ${ImageName}:${ImageVersion}
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true
+        EnvironmentVariables:
+          # this is needed to enable git to find the .git directory once it is in the CodeBuild cache, since it is
+          # on a different filesystem!
+          - Name: GIT_DISCOVERY_ACROSS_FILESYSTEM
+            Value: true
+      ServiceRole: !Ref BuildRole
+      Cache:
+        Type: LOCAL
+        Modes: 
+          - LOCAL_DOCKER_LAYER_CACHE
+      Tags:
+        - Key: Application
+          Value: ram-sample-app
